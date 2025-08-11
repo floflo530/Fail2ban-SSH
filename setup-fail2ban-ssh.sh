@@ -1,164 +1,190 @@
-#!/usr/bin/env bash
-# Installation et configuration de Fail2ban pour Debian 12 (focalisé sur SSH)
-# À exécuter en root (sans sudo). Script idempotent.
+#!/bin/sh
+# Fail2ban setup for Debian 12 (SSH focus)
+# POSIX /bin/sh, ASCII only.
 
-set -euo pipefail
+set -eu
 
-# ---------- Valeurs par défaut ----------
-BANTIME="1h"         # durée de bannissement
-FINDTIME="10m"       # fenêtre d'observation des échecs
-MAXRETRY="5"         # nombre d'essais avant bannissement
-SSH_PORT=""          # détecté automatiquement si vide
-IGNORE_IPS=()        # IP/CIDR à mettre en liste blanche
+# ---------- Defaults ----------
+BANTIME="1h"
+FINDTIME="10m"
+MAXRETRY="5"
+SSH_PORT=""
+IGNORE_IPS="127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+BANACTION=""   # auto-selected
+BACKEND=""     # auto-selected
 
-# ---------- Aide ----------
+# ---------- Help ----------
 usage() {
-  cat <<'EOF'
-Usage : setup-fail2ban-ssh.sh [options]
+cat <<EOF
+Usage: setup-fail2ban-ssh.sh [options]
 
-Options :
-  --bantime DUREE       Durée du bannissement (défaut : 1h)  ex : 15m, 1h, 24h, 1d
-  --findtime DUREE      Fenêtre d'observation (défaut : 10m)
-  --maxretry N          Essais autorisés avant ban (défaut : 5)
-  --ssh-port PORT       Port SSH (détection auto si omis)
-  --ignore-ip IP/CIDR   Ajouter une IP/CIDR en liste blanche (répétable)
-  -h, --help            Afficher l’aide
+Options:
+  --bantime DURATION     default: 1h   ex: 15m, 1h, 24h, 1d
+  --findtime DURATION    default: 10m
+  --maxretry N           default: 5
+  --ssh-port PORT        override SSH port (auto-detected if omitted)
+  --ignore-ip IP/CIDR    add whitelist entry (repeatable)
+  -h, --help             show this help
 
-Exemples :
+Examples:
   ./setup-fail2ban-ssh.sh --ignore-ip 1.2.3.4 --ignore-ip 10.0.0.0/8
   ./setup-fail2ban-ssh.sh --bantime 1d --findtime 20m --maxretry 4
 EOF
 }
 
-# ---------- Contrôles ----------
+# ---------- Root check ----------
 require_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    echo "Ce script doit être exécuté en root." >&2
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Ce script doit etre execute en root." >&2
     exit 1
   fi
 }
 
-parse_args() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --bantime)   BANTIME="${2:-}"; shift 2 ;;
-      --findtime)  FINDTIME="${2:-}"; shift 2 ;;
-      --maxretry)  MAXRETRY="${2:-}"; shift 2 ;;
-      --ssh-port)  SSH_PORT="${2:-}"; shift 2 ;;
-      --ignore-ip) IGNORE_IPS+=("${2:-}";); shift 2 ;;
-      -h|--help)   usage; exit 0 ;;
-      *) echo "Option inconnue : $1"; usage; exit 1 ;;
-    esac
-  done
-}
+# ---------- Arg parsing ----------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --bantime)   BANTIME="${2:-}"; shift 2 ;;
+    --findtime)  FINDTIME="${2:-}"; shift 2 ;;
+    --maxretry)  MAXRETRY="${2:-}"; shift 2 ;;
+    --ssh-port)  SSH_PORT="${2:-}"; shift 2 ;;
+    --ignore-ip) IGNORE_IPS="$IGNORE_IPS ${2:-}"; shift 2 ;;
+    -h|--help)   usage; exit 0 ;;
+    *) echo "Option inconnue: $1"; usage; exit 1 ;;
+  esac
+done
 
+# ---------- Detect SSH port ----------
 detect_ssh_port() {
-  # Si précisé en option, on le garde
-  if [[ -n "${SSH_PORT}" ]]; then
+  if [ -n "$SSH_PORT" ]; then
     return
   fi
-  # Méthode 1 : configuration effective via sshd -T
   if command -v sshd >/dev/null 2>&1; then
-    if SSH_PORT_DET=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}'); then
-      if [[ -n "${SSH_PORT_DET}" ]]; then
-        SSH_PORT="${SSH_PORT_DET}"
-        return
-      fi
+    SSH_PORT_DET="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
+    if [ -n "${SSH_PORT_DET:-}" ]; then
+      SSH_PORT="$SSH_PORT_DET"
+      return
     fi
   fi
-  # Méthode 2 : lecture de /etc/ssh/sshd_config (dernier Port non commenté)
-  if [[ -z "${SSH_PORT}" && -r /etc/ssh/sshd_config ]]; then
-    SSH_PORT=$(awk '/^[[:space:]]*Port[[:space:]]+/ {p=$2} END{if(p)print p}' /etc/ssh/sshd_config || true)
+  if [ -r /etc/ssh/sshd_config ]; then
+    SSH_PORT_PARSE="$(awk '/^[[:space:]]*Port[[:space:]]+/ {p=$2} END{if(p)print p}' /etc/ssh/sshd_config 2>/dev/null || true)"
+    if [ -n "${SSH_PORT_PARSE:-}" ]; then
+      SSH_PORT="$SSH_PORT_PARSE"
+    fi
   fi
-  # Défaut : 22
-  [[ -z "${SSH_PORT}" ]] && SSH_PORT="22"
+  [ -n "$SSH_PORT" ] || SSH_PORT="22"
 }
 
-join_ignore_ips() {
-  local extra=""
-  if [[ ${#IGNORE_IPS[@]} -gt 0 ]]; then
-    extra=" ${IGNORE_IPS[*]}"
-  fi
-  # On inclut loopback + réseaux privés par confort
-  echo "127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16${extra}"
-}
-
-# ---------- Installation ----------
-install_fail2ban() {
-  echo "Installation de fail2ban…"
+# ---------- Package install ----------
+install_packages() {
+  echo "Installation des paquets..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y fail2ban
+  # fail2ban + helpers
+  apt-get install -y fail2ban python3-systemd nftables
+  # enable nftables (harmless if already enabled)
+  systemctl enable --now nftables >/dev/null 2>&1 || true
 }
 
-# ---------- Configuration ----------
-write_config() {
-  local ignoreip_all
-  ignoreip_all="$(join_ignore_ips)"
+# ---------- Select banaction ----------
+select_banaction() {
+  # Prefer nftables if action exists or nft command available
+  if [ -f /etc/fail2ban/action.d/nftables.conf ] || command -v nft >/dev/null 2>&1; then
+    BANACTION="nftables"
+    return
+  fi
+  # Fallbacks
+  if [ -f /etc/fail2ban/action.d/iptables-multiport.conf ]; then
+    BANACTION="iptables-multiport"
+  else
+    BANACTION="iptables-allports"
+  fi
+}
 
-  echo "Écriture de /etc/fail2ban/jail.local…"
-  install -d -m 0755 /etc/fail2ban
-  cat >/etc/fail2ban/jail.local <<EOF
-# Fichier généré par setup-fail2ban-ssh.sh
+# ---------- Select backend ----------
+select_backend() {
+  # Use systemd if python3-systemd import works
+  if command -v python3 >/dev/null 2>&1 && \
+python3 - <<PY 2>/dev/null
+import sys
+try:
+    import systemd.journal  # noqa
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+  then
+    BACKEND="systemd"
+  else
+    BACKEND="auto"
+  fi
+}
+
+# ---------- Write config ----------
+write_config() {
+  echo "Ecriture de /etc/fail2ban/jail.local..."
+  mkdir -p /etc/fail2ban
+  chmod 755 /etc/fail2ban
+
+  cat > /etc/fail2ban/jail.local <<EOF
+# Generated by setup-fail2ban-ssh.sh
 [DEFAULT]
-# Unités : s (secondes), m (minutes), h (heures), d (jours)
 bantime  = ${BANTIME}
 findtime = ${FINDTIME}
 maxretry = ${MAXRETRY}
-
-# Liste blanche (IPs/CIDR jamais bannies)
-ignoreip = ${ignoreip_all}
-
-# Debian 12 utilise nftables ; préférer iptables-nft
-banaction = iptables-nft
-
-# Utiliser journald (plus fiable que les fichiers de log)
-backend = systemd
-
-# (Optionnel) Courriels :
+ignoreip = ${IGNORE_IPS}
+banaction = ${BANACTION}
+backend = ${BACKEND}
+# Email notifications (optional):
 # destemail = root@localhost
-# sender = fail2ban@$(hostname -f)
+# sender = fail2ban@\$(hostname -f)
 # action = %(action_mwl)s
 
 [sshd]
 enabled = true
 port = ${SSH_PORT}
-# Avec backend=systemd, logpath n'est pas nécessaire (lecture du journal)
-# filter = sshd  # filtre par défaut
+# With backend=systemd, logpath is not required.
 EOF
 }
 
-# ---------- Service ----------
-enable_and_start() {
+# ---------- Start service ----------
+start_and_check() {
   systemctl enable fail2ban >/dev/null 2>&1 || true
-  systemctl restart fail2ban
+  systemctl restart fail2ban || true
+  sleep 2
+
+  if systemctl is-active --quiet fail2ban; then
+    echo "Fail2ban actif."
+  else
+    echo "Echec demarrage. Logs suivants:"
+    journalctl -u fail2ban -n 200 --no-pager || true
+    exit 1
+  fi
 }
 
-# ---------- Affichage d'état ----------
+# ---------- Show status ----------
 show_status() {
   echo
-  echo "État global de Fail2ban :"
+  echo "Etat service:"
+  systemctl --no-pager -l status fail2ban || true
+  echo
+  echo "Etat global:"
   fail2ban-client status || true
   echo
-  echo "État de la jail SSHD :"
+  echo "Etat jail sshd:"
   fail2ban-client status sshd || true
-  echo
-  echo "Terminé ✅"
-  echo "Commandes utiles :"
-  echo "  • IP bannies :               fail2ban-client status sshd"
-  echo "  • Débannir une IP :          fail2ban-client set sshd unbanip x.x.x.x"
-  echo "  • Logs Fail2ban :            journalctl -u fail2ban --since '1 hour ago'"
 }
 
-# ---------- Programme principal ----------
 main() {
   require_root
-  parse_args "$@"
   detect_ssh_port
-  install_fail2ban
+  install_packages
+  select_banaction
+  select_backend
   write_config
-  enable_and_start
+  start_and_check
   show_status
+  echo
+  echo "Termine."
 }
 
-main "$@"
+main
